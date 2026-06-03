@@ -1,0 +1,19 @@
+# secrets
+.env
+*.env
+.env.*
+
+# local cache
+embed_cache.json
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# editor / tooling
+.claude/
+.vscode/
+.idea/
+.DS_Store
