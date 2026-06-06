@@ -6,6 +6,22 @@ import sys
 
 bell = lambda x, m, s: np.exp(-((x - m) / s) ** 2 / 2)
 
+# ── Progress reporting hook ───────────────────────────────────────────────────
+# A UI (e.g. the Gradio app) can register a callback to receive status updates.
+# Callback signature: cb(fraction: float in [0,1], desc: str).
+_PROGRESS_CB = None
+def set_progress_cb(cb):
+    """Register a progress callback, or None to disable."""
+    global _PROGRESS_CB
+    _PROGRESS_CB = cb
+def _progress(frac, desc):
+    cb = _PROGRESS_CB
+    if cb is not None:
+        try:
+            cb(min(max(float(frac), 0.0), 1.0), desc)
+        except Exception:
+            pass
+
 # ── CJK font ──────────────────────────────────────────────────────────────────
 def _setup_font():
     want = ["Microsoft YaHei", "SimHei", "SimSun", "Noto Sans CJK SC", "PingFang SC"]
@@ -176,19 +192,35 @@ def latent_to_params(z: np.ndarray) -> dict:
     return dict(m=m, s=s, R=R, T=T, b=b, dominant=dominant, weights=w)
 
 # ── Lenia ─────────────────────────────────────────────────────────────────────
-def run_lenia(params: dict, seed: int, size: int = 64, steps: int = 300) -> np.ndarray:
+def run_lenia(params: dict, seed: int, size: int = 64, steps: int = 300,
+              revive: bool = True, max_tries: int = 8) -> np.ndarray:
+    """Evolve a Lenia field.
+
+    Narrow-growth parameter sets (small s) sometimes land the random initial
+    condition in a "death basin" → the whole field decays to 0 → a solid black
+    pattern.  When `revive` is on, we deterministically retry with alternate
+    seeds (same order every time, so a given char still maps to one stable
+    pattern) until the organism survives.
+    """
     m, s, R, T, b = params["m"], params["s"], params["R"], params["T"], params["b"]
     b   = np.asarray(b)
     mid = size // 2
-    np.random.seed(seed)
-    A = np.random.rand(size, size)
+    # kernel is seed-independent → build its FFT once
     D  = np.linalg.norm(np.mgrid[-mid:mid, -mid:mid], axis=0) / R * len(b)
     K  = (D < len(b)) * b[np.minimum(D.astype(int), len(b) - 1)] * bell(D % 1, 0.5, 0.15)
     fK = np.fft.fft2(np.fft.fftshift(K / np.sum(K)))
-    for _ in range(steps):
-        U = np.real(np.fft.ifft2(fK * np.fft.fft2(A)))
-        A = np.clip(A + 1 / T * (bell(U, m, s) * 2 - 1), 0, 1)
-    return A
+
+    A = None
+    for attempt in range(max_tries if revive else 1):
+        sv = seed if attempt == 0 else (seed * 1000003 + attempt * 7919 + 1) % (2 ** 31)
+        np.random.seed(sv)
+        A = np.random.rand(size, size)
+        for _ in range(steps):
+            U = np.real(np.fft.ifft2(fK * np.fft.fft2(A)))
+            A = np.clip(A + 1 / T * (bell(U, m, s) * 2 - 1), 0, 1)
+        if not revive or float(A.max()) > 1e-3:   # alive → done
+            return A
+    return A                                        # gave up; return last attempt
 
 # ── Display post-processing: threshold + single color ────────────────────────
 COLOR = (0.96, 0.95, 0.90)  # ← 改這裡換顏色 (R, G, B) in [0,1]
@@ -200,6 +232,15 @@ def colorize(A, floor=0.15):
     for i, c in enumerate(COLOR):
         rgb[:, :, i] = mask * c
     return rgb
+
+
+def _scaled_pattern(A, size, psize):
+    """Colorise a Lenia field, optionally magnified so its tile spans `psize`
+    canvas pixels (bigger pattern features, longer tiling period)."""
+    if psize != size:
+        from scipy.ndimage import zoom as _zoom
+        return colorize(_zoom(A, psize / size, order=1))
+    return colorize(A)
 
 # ── Show anchor gallery ───────────────────────────────────────────────────────
 def show_anchors(size=64, steps=300, out="lenia_anchors.png"):
@@ -614,8 +655,182 @@ def show_poem_poly(text, size=84, steps=300, cols=5, row_shift=0.5, out="lenia_p
     print(f"saved → {out}")
 
 
+# ── Shared building blocks for grouped / waves / mixed ────────────────────────
+# These are the single source of truth for the blob & wave pipelines so that
+# show_poem_grouped, show_poem_waves and show_poem_mixed all behave identically
+# (no more divergent inline copies).
+
+def _prepare_patterns(text, size, steps, group_size, want_raw=False,
+                      tag="poem", pat_hi=0.85, pat_scale=1.0):
+    """units → groups → embeddings → Lenia patterns (+ optional raw fields).
+
+    Returns (clean, unique, groups, n_g, zmap, patterns, raw_A, g_z, psize).
+    `pat_scale` magnifies each Lenia pattern so its tile spans more canvas
+    pixels (bigger, less dense) without touching the page/layout geometry.
+    `psize` is the side length of the (possibly magnified) pattern images and
+    is what callers must use as the modulo when sampling `patterns[ch]`.
+    Reports progress for the embedding (①) and pattern-evolution (②) phases.
+    """
+    clean  = _units(text)
+    unique = list(dict.fromkeys(clean))
+    n      = len(clean)
+    groups = [clean[i:i + group_size] for i in range(0, n, group_size)]
+    n_g    = len(groups)
+
+    pat_scale = max(1.0, float(pat_scale))
+    psize     = max(1, int(round(size * pat_scale)))
+
+    print(f"[{tag}] {n} chars → {n_g} groups, generating {len(unique)} patterns "
+          f"(scale ×{pat_scale:.2f} → {psize}px tiles) …")
+    nU = len(unique)
+    zmap = {}
+    for i, ch in enumerate(unique):
+        _progress(0.15 * i / max(nU, 1),
+                  f"① 取得語意向量 (embedding API) {i+1}/{nU}")
+        zmap[ch] = text_to_latent(ch)
+
+    patterns, raw_A = {}, {}
+    for i, ch in enumerate(unique):
+        _progress(0.15 + (pat_hi - 0.15) * i / max(nU, 1),
+                  f"② 演化 Lenia pattern {i+1}/{nU}")
+        params = latent_to_params(zmap[ch])
+        sv = int(hashlib.md5(ch.encode()).hexdigest(), 16) % (2 ** 31)
+        A = run_lenia(params, seed=sv, size=size, steps=steps)
+        if psize != size:                              # smoothly magnify field
+            from scipy.ndimage import zoom as _zoom
+            A_big = _zoom(A, psize / size, order=1)
+            patterns[ch] = colorize(A_big)
+        else:
+            patterns[ch] = colorize(A)
+        if want_raw:
+            raw_A[ch] = A                              # wave edges stay at `size`
+
+    g_z = {g: np.mean([zmap[ch] for ch in grp], axis=0)
+           for g, grp in enumerate(groups)}
+    return clean, unique, groups, n_g, zmap, patterns, raw_A, g_z, psize
+
+
+def _lenia_wave(sig, target_len, smooth=3.0):
+    """Smooth, normalise, and interpolate a 1-D Lenia field slice → wave offsets."""
+    from scipy.ndimage import gaussian_filter1d
+    s = gaussian_filter1d(np.asarray(sig, dtype=float), sigma=smooth)
+    mu, sd = s.mean(), s.std() + 1e-8
+    norm = (s - mu) / sd
+    return np.interp(np.linspace(0, len(norm) - 1, target_len),
+                     np.arange(len(norm)), norm)
+
+
+def _fill_wave_voronoi(canvas, char_idx_c, patterns, zmap, size, row_h,
+                       grp, wy_abs, wx, cx_b, cy_b, w_g, base_idx, z_g):
+    """Wave-block sub-character fill (single source for waves & mixed)."""
+    if not len(wy_abs):
+        return
+    if len(grp) == 1:
+        canvas[wy_abs, wx]     = patterns[grp[0]][wy_abs % size, wx % size]
+        char_idx_c[wy_abs, wx] = base_idx
+        return
+    cr = min(w_g, row_h) * 0.28
+    sub_xy = np.array([
+        [cx_b + cr * np.cos(float(zmap[ch][1]) * 2 * np.pi + k * 2 * np.pi / len(grp)),
+         cy_b + cr * np.sin(float(zmap[ch][1]) * 2 * np.pi + k * 2 * np.pi / len(grp))]
+        for k, ch in enumerate(grp)])
+    asgn = _warped_voronoi_assign(wx, wy_abs, sub_xy, z_g, w_g)
+    for k, ch in enumerate(grp):
+        m = asgn == k
+        canvas[wy_abs[m], wx[m]]     = patterns[ch][wy_abs[m] % size, wx[m] % size]
+        char_idx_c[wy_abs[m], wx[m]] = base_idx + k
+
+
+def _fill_blob_voronoi(canvas, char_idx_c, patterns, zmap, size,
+                       grp, wy_l, wx_l, wy_w, wx_w, base_idx, z_g):
+    """Blob sub-character fill (single source for grouped & mixed)."""
+    if not len(wy_w):
+        return
+    if len(grp) == 1:
+        canvas[wy_w, wx_w]     = patterns[grp[0]][wy_w % size, wx_w % size]
+        char_idx_c[wy_w, wx_w] = base_idx
+        return
+    cx, cy = float(wx_l.mean()), float(wy_l.mean())
+    cr = float(max(np.std(wx_l), np.std(wy_l), 1.0))
+    sub_xy = []
+    for k, ch in enumerate(grp):
+        z = zmap[ch]
+        angle = float(z[1]) * 2 * np.pi + k * 2 * np.pi / len(grp)
+        r = cr * (0.32 + float(z[3]) * 0.16)
+        sub_xy.append([cx + r * np.cos(angle), cy + r * np.sin(angle)])
+    sub_xy = np.array(sub_xy)
+    scale = float(max(np.std(wx_l), np.std(wy_l), 1.0)) * 2
+    asgn = _warped_voronoi_assign(wx_l, wy_l, sub_xy, z_g, scale)
+    for k, ch in enumerate(grp):
+        m = asgn == k
+        canvas[wy_w[m], wx_w[m]]     = patterns[ch][wy_w[m] % size, wx_w[m] % size]
+        char_idx_c[wy_w[m], wx_w[m]] = base_idx + k
+
+
+def _blob_mask(verts, bsz, z_g):
+    """Rasterise a blob polygon → (bsz,bsz) bool mask, with optional punched hole.
+    Single source for grouped & mixed blob shapes."""
+    from matplotlib.path import Path as MplPath
+    yy_l, xx_l = np.mgrid[0:bsz, 0:bsz]
+    bmask = MplPath(verts).contains_points(
+        np.stack([xx_l.ravel(), yy_l.ravel()], axis=1).astype(np.float32)
+    ).reshape(bsz, bsz)
+    if float(z_g[4]) > 0.60:                       # ~40% of blobs get one hole
+        a    = float(z_g[0]) * 2 * np.pi
+        dist = bsz * (0.06 + float(z_g[2]) * 0.22)
+        rad  = bsz * (0.05 + float(z_g[7]) * 0.16)
+        cx_h = bsz / 2 + dist * np.cos(a)
+        cy_h = bsz / 2 + dist * np.sin(a)
+        # ── wobbly hole: radius undulates with angle → petal / amoeba shape ────
+        lobes = 3 + int(float(z_g[1]) * 3.999)     # 3–6 lobes
+        amp   = 0.22 + float(z_g[5]) * 0.38        # wobble depth [0.22, 0.60]
+        phase = float(z_g[6]) * 2 * np.pi          # rotation
+        dxh   = xx_l - cx_h
+        dyh   = yy_l - cy_h
+        ang   = np.arctan2(dyh, dxh)
+        r_th  = rad * (1.0 + amp * np.sin(lobes * ang + phase))
+        bmask[(dxh ** 2 + dyh ** 2) < r_th ** 2] = False
+    return bmask
+
+
+def _draw_group_boundary(canvas, char_idx_c, group_size, mask_before=False):
+    """Black hairline between groups only (not chars within a group)."""
+    from scipy.ndimage import binary_dilation
+    grp_idx_c = np.where(char_idx_c >= 0, char_idx_c // group_size, -1)
+    vc = grp_idx_c[1:, :] != grp_idx_c[:-1, :]
+    hc = grp_idx_c[:, 1:] != grp_idx_c[:, :-1]
+    bm = np.zeros(char_idx_c.shape, bool)
+    bm[1:, :] |= vc; bm[:-1, :] |= vc; bm[:, 1:] |= hc; bm[:, :-1] |= hc
+    if mask_before:                                # grouped variant
+        bm &= (char_idx_c >= 0)
+        canvas[binary_dilation(bm, iterations=1)] = 0.0
+    else:                                          # waves / mixed variant
+        canvas[binary_dilation(bm, iterations=1) & (char_idx_c >= 0)] = 0.0
+
+
+def _canvas_rgba(canvas, floor=0.02):
+    """(H,W,3) float canvas → (H,W,4) RGBA: pattern pixels opaque, the empty
+    (black) background → fully transparent alpha."""
+    rgb   = np.clip(canvas, 0.0, 1.0)
+    alpha = (rgb.max(axis=2) > floor).astype(np.float32)
+    return np.dstack([rgb, alpha])
+
+
+def _render_save(canvas, W, H, out, pad=0.0):
+    """Shared figure render + save (transparent bg, 2× dpi)."""
+    dpi = 110
+    rgba = _canvas_rgba(canvas)
+    fig, ax = plt.subplots(figsize=(W / dpi, H / dpi))
+    fig.patch.set_alpha(0.0); ax.patch.set_alpha(0.0)
+    ax.imshow(rgba, interpolation="bilinear")
+    ax.set_xlim(0, W); ax.set_ylim(H, 0); ax.axis("off")
+    plt.tight_layout(pad=pad)
+    plt.savefig(out, dpi=dpi * 2, bbox_inches="tight", transparent=True)
+    plt.show();  print(f"saved → {out}")
+
+
 # ── Wave-boundary row layout ──────────────────────────────────────────────────
-def show_poem_waves(text, size=160, steps=300, cols=5, group_size=1, row_shift=0.5, out="lenia_waves.png"):
+def show_poem_waves(text, size=160, steps=300, cols=5, group_size=1, row_shift=0.5, pat_scale=1.0, out="lenia_waves.png"):
     """
     Characters grouped into blocks, laid out in rows.
     Each block has flat top/bottom (row-aligned) and wavy left/right edges.
@@ -623,36 +838,11 @@ def show_poem_waves(text, size=160, steps=300, cols=5, group_size=1, row_shift=0
     Blocks can have at most one circular hole/notch (derived from group z).
     Visible gap between blocks; rows separated by a black horizontal strip.
     """
-    from scipy.ndimage import binary_dilation
-
-    clean  = _units(text)
-    unique = list(dict.fromkeys(clean))
-    n      = len(clean)
-    groups = [clean[i:i+group_size] for i in range(0, n, group_size)]
-    n_g    = len(groups)
-
-    print(f"[waves] {n} chars → {n_g} blocks, generating {len(unique)} patterns …")
-    zmap = {ch: text_to_latent(ch) for ch in unique}
-    patterns = {}
-    raw_A    = {}                   # keep the raw [0,1] Lenia field for wave shaping
-    for ch in unique:
-        params  = latent_to_params(zmap[ch])
-        sv      = int(hashlib.md5(ch.encode()).hexdigest(), 16) % (2**31)
-        A       = run_lenia(params, seed=sv, size=size, steps=steps)
-        raw_A[ch]   = A
-        patterns[ch] = colorize(A)
-
-    from scipy.ndimage import gaussian_filter1d
-
-    def _lenia_wave(signal_1d, target_len, smooth=3.0):
-        """Smooth, normalise, and interpolate a 1-D Lenia field slice."""
-        s = gaussian_filter1d(signal_1d.astype(float), sigma=smooth)
-        mu, sd = s.mean(), s.std() + 1e-8
-        norm = (s - mu) / sd
-        return np.interp(np.linspace(0, len(norm) - 1, target_len),
-                         np.arange(len(norm)), norm)
-
-    g_z = {g: np.mean([zmap[ch] for ch in grp], axis=0) for g, grp in enumerate(groups)}
+    (clean, unique, groups, n_g, zmap, patterns,
+     raw_A, g_z, psize) = _prepare_patterns(text, size, steps, group_size,
+                                            want_raw=True, tag="waves",
+                                            pat_scale=pat_scale)
+    _progress(0.85, "③ 排版與分組填色")
 
     rows    = (n_g + cols - 1) // cols
     block_w = int(size * max(group_size * 0.65, 0.85))  # thin per char
@@ -674,7 +864,6 @@ def show_poem_waves(text, size=160, steps=300, cols=5, group_size=1, row_shift=0
         y0         = r * (row_h + gap_h)
         y1         = y0 + row_h
         row_g_idxs = list(range(r * cols, min((r + 1) * cols, n_g)))
-        t          = np.arange(row_h)
 
         row_avg_z  = np.mean([g_z[g] for g in row_g_idxs], axis=0)
         row_x_off  = int((float(row_avg_z[0]) - 0.5) * 2 * max_row_shift)
@@ -690,14 +879,9 @@ def show_poem_waves(text, size=160, steps=300, cols=5, group_size=1, row_shift=0
             brx  = blx + w_g
 
             # ── Lenia-derived wavy edges ──────────────────────────────────────
-            # Average the group's raw Lenia fields, then extract 1-D row signals.
             avg_A = np.mean([raw_A[ch] for ch in grp], axis=0)   # (size, size)
-
-            # Left boundary: straight vertical line
-            lw = np.full(row_h, float(blx))
-
-            # Right boundary: Lenia-derived wave
-            # z_g[3] controls smoothing → wavelength: small sigma=dense, large=gentle
+            lw = np.full(row_h, float(blx))                      # straight left
+            # Right boundary: Lenia-derived wave (z_g[3] → wavelength)
             smooth_r = 1.0 + float(z_g[3]) * 9.0          # [1, 10]
             sig_r    = avg_A[:, size // 2:].mean(axis=1)
             wv_r     = _lenia_wave(sig_r, row_h, smooth=smooth_r)
@@ -707,58 +891,28 @@ def show_poem_waves(text, size=160, steps=300, cols=5, group_size=1, row_shift=0
             # ── block pixel mask ─────────────────────────────────────────────
             lw2 = lw[:, None];  rw2 = rw[:, None]
             bmask = (xs_all[None, :] >= lw2) & (xs_all[None, :] < rw2)  # (row_h, W)
-
             iy_rel, wx = np.where(bmask)
             wy_abs = iy_rel + y0
             if not len(wy_abs):
                 continue
 
-            # ── organic 2D subdivision: Lenia field competition ──────────────
-            # Centered zoom: block centre maps to pattern centre so alive cells
-            # are always visible regardless of where they sit in the pattern.
             cx_b = float(blx + brx) / 2
             cy_b = float(y0  + y1)  / 2
+            _fill_wave_voronoi(canvas, char_idx_c, patterns, zmap, psize, row_h,
+                               grp, wy_abs, wx, cx_b, cy_b, w_g,
+                               g * group_size, z_g)
 
-            if len(grp) == 1:
-                canvas[wy_abs, wx]     = patterns[grp[0]][wy_abs % size, wx % size]
-                char_idx_c[wy_abs, wx] = g * group_size
-            else:
-                cr = min(w_g, row_h) * 0.28
-                sub_xy = np.array([
-                    [cx_b + cr * np.cos(float(zmap[ch][1])*2*np.pi
-                                        + k * 2*np.pi / len(grp)),
-                     cy_b + cr * np.sin(float(zmap[ch][1])*2*np.pi
-                                        + k * 2*np.pi / len(grp))]
-                    for k, ch in enumerate(grp)
-                ])
-                assign = _warped_voronoi_assign(wx, wy_abs, sub_xy, z_g, w_g)
-                for k, ch in enumerate(grp):
-                    m = assign == k
-                    canvas[wy_abs[m], wx[m]]     = patterns[ch][wy_abs[m] % size,
-                                                                 wx[m]     % size]
-                    char_idx_c[wy_abs[m], wx[m]] = g * group_size + k
-
-    # ── thin boundary ─────────────────────────────────────────────────────────
-    vc = char_idx_c[1:,:] != char_idx_c[:-1,:]
-    hc = char_idx_c[:,1:] != char_idx_c[:,:-1]
-    bm = np.zeros((H,W), bool)
-    bm[1:,:]|=vc; bm[:-1,:]|=vc; bm[:,1:]|=hc; bm[:,:-1]|=hc
-    canvas[binary_dilation(bm, iterations=1) & (char_idx_c >= 0)] = 0.0
-
-    dpi = 110
-    fig, ax = plt.subplots(figsize=(W/dpi, H/dpi))
-    fig.patch.set_facecolor("#000000"); ax.set_facecolor("#000000")
-    ax.imshow(canvas, interpolation="bilinear")
-    ax.set_xlim(0, W); ax.set_ylim(H, 0); ax.axis("off")
-    plt.tight_layout(pad=0)
-    plt.savefig(out, dpi=dpi*2, bbox_inches="tight", facecolor="#000000")
-    plt.show();  print(f"saved → {out}")
+    # group-to-group seam removed (groups now merge seamlessly where they touch)
+    # _draw_group_boundary(canvas, char_idx_c, group_size)
+    _progress(0.95, "④ 輸出影像")
+    _render_save(canvas, W, H, out, pad=0)
+    _progress(1.0, "完成")
 
 
 # ── Mixed: wave + blob per group ──────────────────────────────────────────────
 def show_poem_mixed(text, size=160, steps=300, cols=5, group_size=1, row_shift=0.5,
                     germ=False, germ_steps=100,
-                    germ_sa=38.0, germ_ra=45.0, germ_so=9,
+                    germ_sa=38.0, germ_ra=45.0, germ_so=9, pat_scale=1.0,
                     out="lenia_mixed.png"):
     """
     Waves layout as base; groups with z_g[2] > 0.5 render as grouped blobs.
@@ -766,25 +920,11 @@ def show_poem_mixed(text, size=160, steps=300, cols=5, group_size=1, row_shift=0
       WAVE → same algorithm as show_poem_waves
       BLOB → same algorithm as show_poem_grouped, centred on the grid cell
     """
-    from scipy.ndimage import binary_dilation, gaussian_filter1d
-    from matplotlib.path import Path as MplPath
-
-    clean  = _units(text)
-    unique = list(dict.fromkeys(clean))
-    n      = len(clean)
-    groups = [clean[i:i+group_size] for i in range(0, n, group_size)]
-    n_g    = len(groups)
-
-    print(f"[mixed] {n} chars → {n_g} groups, generating {len(unique)} patterns …")
-    zmap = {ch: text_to_latent(ch) for ch in unique}
-    raw_A = {}; patterns = {}
-    for ch in unique:
-        params = latent_to_params(zmap[ch])
-        sv = int(hashlib.md5(ch.encode()).hexdigest(), 16) % (2**31)
-        A  = run_lenia(params, seed=sv, size=size, steps=steps)
-        raw_A[ch] = A;  patterns[ch] = colorize(A)
-
-    g_z = {g: np.mean([zmap[ch] for ch in grp], axis=0) for g, grp in enumerate(groups)}
+    (clean, unique, groups, n_g, zmap, patterns,
+     raw_A, g_z, psize) = _prepare_patterns(text, size, steps, group_size,
+                                            want_raw=True, tag="mixed",
+                                            pat_hi=0.80, pat_scale=pat_scale)
+    _progress(0.80, "③ 排版與分組填色")
 
     # ── shared grid layout (same as show_poem_waves) ──────────────────────────
     rows    = (n_g + cols - 1) // cols
@@ -799,53 +939,6 @@ def show_poem_mixed(text, size=160, steps=300, cols=5, group_size=1, row_shift=0
     canvas     = np.zeros((H, W, 3))
     char_idx_c = np.full((H, W), -1, np.int32)
     xs_all     = np.arange(W)
-
-    def _lenia_wave(sig, n, smooth=3.0):
-        s = gaussian_filter1d(sig.astype(float), sigma=smooth)
-        mu, sd = s.mean(), s.std() + 1e-8
-        norm = (s - mu) / sd
-        return np.interp(np.linspace(0, len(norm)-1, n), np.arange(len(norm)), norm)
-
-    def _fill_waves(grp, wy_abs, wx, cx_b, cy_b, w_g, base_idx, z_g):
-        """Warped-Voronoi fill matching show_poem_waves."""
-        if not len(wy_abs): return
-        if len(grp) == 1:
-            canvas[wy_abs, wx] = patterns[grp[0]][wy_abs % size, wx % size]
-            char_idx_c[wy_abs, wx] = base_idx
-        else:
-            cr = min(w_g, row_h) * 0.28
-            sub_xy = np.array([
-                [cx_b + cr * np.cos(float(zmap[ch][1])*2*np.pi + k*2*np.pi/len(grp)),
-                 cy_b + cr * np.sin(float(zmap[ch][1])*2*np.pi + k*2*np.pi/len(grp))]
-                for k, ch in enumerate(grp)])
-            asgn = _warped_voronoi_assign(wx, wy_abs, sub_xy, z_g, w_g)
-            for k, ch in enumerate(grp):
-                m = asgn == k
-                canvas[wy_abs[m], wx[m]] = patterns[ch][wy_abs[m]%size, wx[m]%size]
-                char_idx_c[wy_abs[m], wx[m]] = base_idx + k
-
-    def _fill_grouped(grp, wy_l, wx_l, wy_w, wx_w, base_idx, z_g):
-        """Warped-Voronoi fill matching show_poem_grouped."""
-        if not len(wy_w): return
-        if len(grp) == 1:
-            canvas[wy_w, wx_w] = patterns[grp[0]][wy_w % size, wx_w % size]
-            char_idx_c[wy_w, wx_w] = base_idx
-        else:
-            cx, cy = float(wx_l.mean()), float(wy_l.mean())
-            cr = float(max(np.std(wx_l), np.std(wy_l), 1.0))
-            sub_xy = []
-            for k, ch in enumerate(grp):
-                z     = zmap[ch]
-                angle = float(z[1]) * 2*np.pi + k * 2*np.pi / len(grp)
-                r     = cr * (0.32 + float(z[3]) * 0.16)
-                sub_xy.append([cx + r*np.cos(angle), cy + r*np.sin(angle)])
-            sub_xy = np.array(sub_xy)
-            scale  = float(max(np.std(wx_l), np.std(wy_l), 1.0)) * 2
-            asgn   = _warped_voronoi_assign(wx_l, wy_l, sub_xy, z_g, scale)
-            for k, ch in enumerate(grp):
-                m = asgn == k
-                canvas[wy_w[m], wx_w[m]] = patterns[ch][wy_w[m]%size, wx_w[m]%size]
-                char_idx_c[wy_w[m], wx_w[m]] = base_idx + k
 
     max_row_shift = int(gap_bw * row_shift)
 
@@ -867,52 +960,41 @@ def show_poem_mixed(text, size=160, steps=300, cols=5, group_size=1, row_shift=0
             base = g * group_size
 
             if float(z_g[2]) > 0.75:
-                # ── BLOB (show_poem_grouped algorithm) ────────────────────────
+                # ── BLOB (shared show_poem_grouped pipeline) ──────────────────
                 bsz   = int(size * (1.0 + float(z_g[4]) * 0.7))
                 verts = _char_to_curve(z_g, bsz)
-                centroid = verts.mean(axis=0)
+                centroid  = verts.mean(axis=0)
                 blob_xoff = int(block_w * (float(z_g[5]) - 0.5) * 0.80)
                 ox = int(np.clip(cell_cx - centroid[0] + blob_xoff, 0, W - bsz))
                 oy = int(np.clip(cy_b    - centroid[1],          0, H - bsz))
 
-                yy_l, xx_l = np.mgrid[0:bsz, 0:bsz]
-                path  = MplPath(verts)
-                bmask = path.contains_points(
-                    np.stack([xx_l.ravel(), yy_l.ravel()], axis=1).astype(np.float32)
-                ).reshape(bsz, bsz)
-
-                # hole punching (from show_poem_grouped)
-                if float(z_g[4]) > 0.60:
-                    a    = float(z_g[0]) * 2 * np.pi
-                    dist = bsz * (0.06 + float(z_g[2]) * 0.22)
-                    rad  = bsz * (0.05 + float(z_g[7]) * 0.16)
-                    cx_h = bsz / 2 + dist * np.cos(a)
-                    cy_h = bsz / 2 + dist * np.sin(a)
-                    bmask[(xx_l - cx_h)**2 + (yy_l - cy_h)**2 < rad**2] = False
-
+                bmask = _blob_mask(verts, bsz, z_g)
                 wy_l, wx_l = np.where(bmask)
                 wy_w = wy_l + oy;  wx_w = wx_l + ox
                 valid = (wy_w >= 0) & (wy_w < H) & (wx_w >= 0) & (wx_w < W)
-                _fill_grouped(grp, wy_l[valid], wx_l[valid], wy_w[valid], wx_w[valid], base, z_g)
+                _fill_blob_voronoi(canvas, char_idx_c, patterns, zmap, psize,
+                                   grp, wy_l[valid], wx_l[valid],
+                                   wy_w[valid], wx_w[valid], base, z_g)
 
             else:
-                # ── WAVE (show_poem_waves algorithm) ──────────────────────────
-                lw    = np.full(row_h, float(blx))
+                # ── WAVE (shared show_poem_waves pipeline) ────────────────────
                 avg_A = np.mean([raw_A[ch] for ch in grp], axis=0)
                 sm    = 1.0 + float(z_g[3]) * 9.0
                 wv_r  = _lenia_wave(avg_A[:, size//2:].mean(axis=1), row_h, sm)
                 amp_r = w_g * (0.06 + float(z_g[5]) * 0.07)
                 rw    = brx - amp_r * wv_r
-                lw2 = lw[:, None];  rw2 = rw[:, None]
+                lw2 = np.full(row_h, float(blx))[:, None];  rw2 = rw[:, None]
                 bmask = (xs_all[None, :] >= lw2) & (xs_all[None, :] < rw2)
                 iy_rel, wx = np.where(bmask)
                 wy_abs = iy_rel + y0
                 cx_b = float(blx + brx) / 2
-                _fill_waves(grp, wy_abs, wx, cx_b, cy_b, w_g, base, z_g)
+                _fill_wave_voronoi(canvas, char_idx_c, patterns, zmap, psize, row_h,
+                                   grp, wy_abs, wx, cx_b, cy_b, w_g, base, z_g)
 
     # ── Physarum germ: one global run over the full canvas, then overlay ─────
     if germ:
         from scipy.ndimage import binary_dilation as _bd
+        _progress(0.85, f"④ 演化黏菌 Physarum ({germ_steps} 步)")
         print(f"[mixed_germ] running global Physarum on {W}×{H} canvas…")
         sv = int(hashlib.md5(text.encode()).hexdigest(), 16) % (2**31)
         T  = _global_physarum(W, H, n_steps=germ_steps,
@@ -920,9 +1002,9 @@ def show_poem_mixed(text, size=160, steps=300, cols=5, group_size=1, row_shift=0
         thresh     = np.percentile(T, 80)
         trail_mask = _bd(T > thresh, iterations=3)
 
-        # only ~1/8 of groups get carved; the rest are immune
+        # only ~1/5 of groups get carved; the rest are immune
         rng_g   = np.random.default_rng(sv % (2**32))
-        affected = rng_g.random(n_g) < (1 / 5)          # ~1 in 5 groups
+        affected = rng_g.random(n_g) < (1 / 5)
         carved_px = np.zeros((H, W), bool)
         for g in range(n_g):
             if not affected[g]:
@@ -933,20 +1015,11 @@ def show_poem_mixed(text, size=160, steps=300, cols=5, group_size=1, row_shift=0
             carved_px |= group_mask
         canvas[trail_mask & carved_px] = 0.0
 
-    vc = char_idx_c[1:,:] != char_idx_c[:-1,:]
-    hc = char_idx_c[:,1:] != char_idx_c[:,:-1]
-    bm = np.zeros((H,W), bool)
-    bm[1:,:]|=vc; bm[:-1,:]|=vc; bm[:,1:]|=hc; bm[:,:-1]|=hc
-    canvas[binary_dilation(bm, iterations=1) & (char_idx_c >= 0)] = 0.0
-
-    dpi = 110
-    fig, ax = plt.subplots(figsize=(W/dpi, H/dpi))
-    fig.patch.set_facecolor("#000000"); ax.set_facecolor("#000000")
-    ax.imshow(canvas, interpolation="bilinear")
-    ax.set_xlim(0,W); ax.set_ylim(H,0); ax.axis("off")
-    plt.tight_layout(pad=0)
-    plt.savefig(out, dpi=dpi*2, bbox_inches="tight", facecolor="#000000")
-    plt.show();  print(f"saved → {out}")
+    # group-to-group seam removed (groups now merge seamlessly where they touch)
+    # _draw_group_boundary(canvas, char_idx_c, group_size)
+    _progress(0.95, "⑤ 輸出影像")
+    _render_save(canvas, W, H, out, pad=0)
+    _progress(1.0, "完成")
 
 
 # ── Path + warped-Voronoi layout ──────────────────────────────────────────────
@@ -1061,17 +1134,7 @@ def show_poem_path(text, size=80, steps=300, cols=5, out="lenia_path.png"):
     canvas[~MplPath(np.stack([xf, yf], axis=1)).contains_points(pts).reshape(H, W)] = 0.0
 
     # ── render ─────────────────────────────────────────────────────────────────
-    dpi = 110
-    fig, ax = plt.subplots(figsize=(W / dpi, H / dpi))
-    fig.patch.set_facecolor("#080808")
-    ax.set_facecolor("#080808")
-    ax.imshow(canvas, interpolation="bilinear")
-    ax.set_xlim(0, W); ax.set_ylim(H, 0)
-    ax.axis("off")
-    plt.tight_layout(pad=0)
-    plt.savefig(out, dpi=dpi*2, bbox_inches="tight", facecolor="#000000")
-    plt.show()
-    print(f"saved → {out}")
+    _render_save(canvas, W, H, out, pad=0)
 
 
 # ── C: anisotropic competitive growth ─────────────────────────────────────────
@@ -1158,17 +1221,11 @@ def show_poem_growth(text, size=80, steps=300, cols=5, out="lenia_growth.png"):
     pts=np.stack([xx.ravel(),yy.ravel()],axis=1).astype(np.float32)
     canvas[~MplPath(np.stack([xf,yf],axis=1)).contains_points(pts).reshape(H,W)] = 0.0
 
-    dpi=110; fig,ax=plt.subplots(figsize=(W/dpi,H/dpi))
-    fig.patch.set_facecolor("#000000"); ax.set_facecolor("#000000")
-    ax.imshow(canvas, interpolation="bilinear")
-    ax.set_xlim(0,W); ax.set_ylim(H,0); ax.axis("off")
-    plt.tight_layout(pad=0)
-    plt.savefig(out, dpi=dpi*2, bbox_inches="tight", facecolor="#000000")
-    plt.show();  print(f"saved → {out}")
+    _render_save(canvas, W, H, out, pad=0)
 
 
 # ── Grouped blobs: each organic blob contains 2-3 chars ───────────────────────
-def show_poem_grouped(text, size=144, steps=300, cols=4, group_size=3, out="lenia_grouped.png"):
+def show_poem_grouped(text, size=144, steps=300, cols=4, group_size=3, pat_scale=1.0, out="lenia_grouped.png"):
     """
     Characters are grouped (2-3 per group).  Each group gets ONE organic blob
     shape (from the group's average latent vector, via _char_to_curve).
@@ -1176,26 +1233,13 @@ def show_poem_grouped(text, size=144, steps=300, cols=4, group_size=3, out="leni
     each sub-region is filled with its character's own Lenia pattern.
     Blobs float separately on a dark background — no single giant canvas.
     """
-    from matplotlib.path import Path as MplPath
-    from scipy.ndimage import binary_dilation
-
-    clean  = _units(text)
-    unique = list(dict.fromkeys(clean))
-    n      = len(clean)
-    groups = [clean[i:i+group_size] for i in range(0, n, group_size)]
-    n_g    = len(groups)
-
-    # individual Lenia patterns
-    print(f"[grouped] {n} chars → {n_g} blobs, generating {len(unique)} patterns …")
-    zmap     = {ch: text_to_latent(ch) for ch in unique}
-    patterns = {}
-    for ch in unique:
-        params = latent_to_params(zmap[ch])
-        sv     = int(hashlib.md5(ch.encode()).hexdigest(), 16) % (2**31)
-        patterns[ch] = colorize(run_lenia(params, seed=sv, size=size, steps=steps))
+    (clean, unique, groups, n_g, zmap, patterns,
+     _raw, g_z, psize) = _prepare_patterns(text, size, steps, group_size,
+                                           want_raw=False, tag="grouped",
+                                           pat_scale=pat_scale)
+    _progress(0.85, "③ 排版與繪製 blob")
 
     # per-group blob sizes derived from z[4]: range [1.3, 2.2] × size
-    g_z   = {g: np.mean([zmap[ch] for ch in grp], axis=0) for g, grp in enumerate(groups)}
     g_blob = {g: int(size * (1.3 + float(g_z[g][4]) * 0.9)) for g in range(n_g)}
 
     # blob curves: one per group, using per-group blob size
@@ -1231,21 +1275,9 @@ def show_poem_grouped(text, size=144, steps=300, cols=4, group_size=3, out="leni
         verts  = g_crv[g]
         blob   = g_blob[g]   # per-group blob size
 
-        # blob mask in local (blob×blob) space
-        path     = MplPath(verts)
-        yy_l, xx_l = np.mgrid[0:blob, 0:blob]
-        pts_l    = np.stack([xx_l.ravel(), yy_l.ravel()], axis=1).astype(np.float32)
-        bmask    = path.contains_points(pts_l).reshape(blob, blob)
-
-        # ── optionally punch ONE circular hole (only ~40% of blobs get one) ────
+        # blob mask (polygon + optional punched hole) — shared helper
         z_g = g_z[g]
-        if float(z_g[4]) > 0.60:                      # ~40% chance
-            a    = float(z_g[0]) * 2 * np.pi          # angle
-            dist = blob * (0.06 + float(z_g[2]) * 0.22)   # [0.06, 0.28] from centre
-            rad  = blob * (0.05 + float(z_g[7]) * 0.16)   # [0.05, 0.21] — wide range
-            cx_h = blob / 2 + dist * np.cos(a)
-            cy_h = blob / 2 + dist * np.sin(a)
-            bmask[(xx_l - cx_h) ** 2 + (yy_l - cy_h) ** 2 < rad ** 2] = False
+        bmask = _blob_mask(verts, blob, z_g)
 
         wy_l, wx_l = np.where(bmask)
         if not len(wy_l):
@@ -1256,47 +1288,14 @@ def show_poem_grouped(text, size=144, steps=300, cols=4, group_size=3, out="leni
         valid = (wy_w < H) & (wx_w < W)
         wy_l, wx_l, wy_w, wx_w = wy_l[valid], wx_l[valid], wy_w[valid], wx_w[valid]
 
-        if len(grp) == 1:
-            flat_i = g * group_size
-            canvas[wy_w, wx_w]     = patterns[grp[0]][wy_w % size, wx_w % size]
-            char_idx_c[wy_w, wx_w] = flat_i
-        else:
-            # mini-Voronoi: sub-seeds from individual z[1],z[3] (distinct from blob pos z[5,6])
-            cx, cy = float(wx_l.mean()), float(wy_l.mean())
-            cr     = float(max(np.std(wx_l), np.std(wy_l), 1.0))
-            sub_xy = []
-            for k, ch in enumerate(grp):
-                z     = zmap[ch]
-                angle = float(z[1]) * 2*np.pi + k * 2*np.pi / len(grp)
-                r     = cr * (0.32 + float(z[3]) * 0.16)
-                sub_xy.append([cx + r*np.cos(angle), cy + r*np.sin(angle)])
-            sub_xy = np.array(sub_xy)
-            z_g    = np.mean([zmap[ch] for ch in grp], axis=0)
-            scale  = float(max(np.std(wx_l), np.std(wy_l), 1.0)) * 2
-            slbl   = _warped_voronoi_assign(wx_l, wy_l, sub_xy, z_g, scale)
-            for k, ch in enumerate(grp):
-                m = slbl == k
-                flat_i = g * group_size + k
-                canvas[wy_w[m], wx_w[m]]     = patterns[ch][wy_w[m] % size, wx_w[m] % size]
-                char_idx_c[wy_w[m], wx_w[m]] = flat_i
+        _fill_blob_voronoi(canvas, char_idx_c, patterns, zmap, psize,
+                           grp, wy_l, wx_l, wy_w, wx_w, g * group_size, z_g)
 
-    # thin boundary between char sub-regions
-    vc = char_idx_c[1:,:] != char_idx_c[:-1,:]
-    hc = char_idx_c[:,1:] != char_idx_c[:,:-1]
-    bc = np.zeros((H,W), bool)
-    bc[1:,:]|=vc; bc[:-1,:]|=vc; bc[:,1:]|=hc; bc[:,:-1]|=hc
-    # only draw where both sides are inside a blob (≥0)
-    bc &= (char_idx_c >= 0)
-    canvas[binary_dilation(bc, iterations=1)] = 0.0
-
-    dpi = 110
-    fig, ax = plt.subplots(figsize=(W/dpi, H/dpi))
-    fig.patch.set_facecolor("#000000"); ax.set_facecolor("#000000")
-    ax.imshow(canvas, interpolation="bilinear")
-    ax.set_xlim(0, W); ax.set_ylim(H, 0); ax.axis("off")
-    plt.tight_layout(pad=0.1)
-    plt.savefig(out, dpi=dpi*2, bbox_inches="tight", facecolor="#000000")
-    plt.show();  print(f"saved → {out}")
+    # group-to-group seam removed (groups now merge seamlessly where they touch)
+    # _draw_group_boundary(canvas, char_idx_c, group_size, mask_before=True)
+    _progress(0.95, "④ 輸出影像")
+    _render_save(canvas, W, H, out, pad=0.1)
+    _progress(1.0, "完成")
 
 
 # ── D-blend: noise banding where each group shares ONE blended Lenia ──────────
@@ -1385,18 +1384,12 @@ def show_poem_noise_blend(text, size=80, steps=300, cols=5, group_size=3, out="l
     pts=np.stack([xx.ravel(),yy.ravel()],axis=1).astype(np.float32)
     canvas[~MplPath(np.stack([xf,yf],axis=1)).contains_points(pts).reshape(H,W)] = 0.0
 
-    dpi=110; fig,ax=plt.subplots(figsize=(W/dpi,H/dpi))
-    fig.patch.set_facecolor("#000000"); ax.set_facecolor("#000000")
-    ax.imshow(canvas, interpolation="bilinear")
-    ax.set_xlim(0,W); ax.set_ylim(H,0); ax.axis("off")
-    plt.tight_layout(pad=0)
-    plt.savefig(out, dpi=dpi*2, bbox_inches="tight", facecolor="#000000")
-    plt.show();  print(f"saved → {out}")
+    _render_save(canvas, W, H, out, pad=0)
 
 
 # ── D: smooth noise-field banding ─────────────────────────────────────────────
 def show_poem_noise(text, size=160, steps=300, cols=5, group_size=3,
-                    octaves=4, wave_base=1.3, out="lenia_noise.png"):
+                    octaves=4, wave_base=1.3, pat_scale=1.0, out="lenia_noise.png"):
     """
     Approach D: a smooth 2D scalar field is built from a few low-frequency
     sinusoids (direction and wavelength from the poem's latent vectors).
@@ -1414,14 +1407,17 @@ def show_poem_noise(text, size=160, steps=300, cols=5, group_size=3,
     unique = list(dict.fromkeys(clean))
     n      = len(clean)
 
-    print(f"[noise] generating {len(unique)} patterns …")
+    pat_scale = max(1.0, float(pat_scale))
+    psize     = max(1, int(round(size * pat_scale)))
+    print(f"[noise] generating {len(unique)} patterns (×{pat_scale:.2f} → {psize}px) …")
     patterns = {}
     zmap     = {}
     for ch in unique:
         z = text_to_latent(ch);  zmap[ch] = z
         params = latent_to_params(z)
         sv = int(hashlib.md5(ch.encode()).hexdigest(), 16) % (2**31)
-        patterns[ch] = colorize(run_lenia(params, seed=sv, size=size, steps=steps))
+        patterns[ch] = _scaled_pattern(
+            run_lenia(params, seed=sv, size=size, steps=steps), size, psize)
 
     rows = (n + cols - 1) // cols
     cell = int(size * 1.7);  W, H = cols * cell, rows * cell
@@ -1490,7 +1486,7 @@ def show_poem_noise(text, size=160, steps=300, cols=5, group_size=3,
         for k, ch in enumerate(group):
             wy, wx = np.where(char_labels == g*group_size + k)
             if len(wy):
-                canvas[wy, wx] = patterns[ch][wy % size, wx % size]
+                canvas[wy, wx] = patterns[ch][wy % psize, wx % psize]
 
     # ── two-level boundaries ──────────────────────────────────────────────────
     def _bnd(lbl, itr):
@@ -1514,13 +1510,7 @@ def show_poem_noise(text, size=160, steps=300, cols=5, group_size=3,
     pts=np.stack([xx.ravel(),yy.ravel()],axis=1).astype(np.float32)
     canvas[~MplPath(np.stack([xf,yf],axis=1)).contains_points(pts).reshape(H,W)] = 0.0
 
-    dpi=110; fig,ax=plt.subplots(figsize=(W/dpi,H/dpi))
-    fig.patch.set_facecolor("#000000"); ax.set_facecolor("#000000")
-    ax.imshow(canvas, interpolation="bilinear")
-    ax.set_xlim(0,W); ax.set_ylim(H,0); ax.axis("off")
-    plt.tight_layout(pad=0)
-    plt.savefig(out, dpi=dpi*2, bbox_inches="tight", facecolor="#000000")
-    plt.show();  print(f"saved → {out}")
+    _render_save(canvas, W, H, out, pad=0)
 
 
 # ── Watershed tessellation layout ─────────────────────────────────────────────
@@ -1634,21 +1624,11 @@ def show_poem_watershed(text, size=80, steps=300, cols=5, out="lenia_watershed.p
     canvas[~outer_mask] = 0.0
 
     # ── render ─────────────────────────────────────────────────────────────────
-    dpi = 110
-    fig, ax = plt.subplots(figsize=(W / dpi, H / dpi))
-    fig.patch.set_facecolor("#080808")
-    ax.set_facecolor("#080808")
-    ax.imshow(canvas, interpolation="bilinear")
-    ax.set_xlim(0, W); ax.set_ylim(H, 0)
-    ax.axis("off")
-    plt.tight_layout(pad=0)
-    plt.savefig(out, dpi=dpi*2, bbox_inches="tight", facecolor="#000000")
-    plt.show()
-    print(f"saved → {out}")
+    _render_save(canvas, W, H, out, pad=0)
 
 
 # ── Voronoi tessellation layout ───────────────────────────────────────────────
-def show_poem_voronoi(text, size=160, steps=300, cols=5, out="lenia_voronoi.png"):
+def show_poem_voronoi(text, size=160, steps=300, cols=5, pat_scale=1.0, out="lenia_voronoi.png"):
     """
     Divide the canvas into N Voronoi cells — one per character occurrence.
     Seed positions come from the latent vector (jittered grid via z[5], z[6]).
@@ -1662,7 +1642,10 @@ def show_poem_voronoi(text, size=160, steps=300, cols=5, out="lenia_voronoi.png"
     unique = list(dict.fromkeys(clean))
     n      = len(clean)
 
-    print(f"generating {len(unique)} Lenia patterns for {n} cells …")
+    pat_scale = max(1.0, float(pat_scale))
+    psize     = max(1, int(round(size * pat_scale)))
+    print(f"generating {len(unique)} Lenia patterns for {n} cells "
+          f"(×{pat_scale:.2f} → {psize}px) …")
     patterns = {}
     zmap     = {}
     for ch in unique:
@@ -1671,7 +1654,7 @@ def show_poem_voronoi(text, size=160, steps=300, cols=5, out="lenia_voronoi.png"
         params     = latent_to_params(z)
         seed_v     = int(hashlib.md5(ch.encode()).hexdigest(), 16) % (2 ** 31)
         A          = run_lenia(params, seed=seed_v, size=size, steps=steps)
-        patterns[ch] = colorize(A)   # (size, size, 3)
+        patterns[ch] = _scaled_pattern(A, size, psize)   # (psize, psize, 3)
 
     # ── canvas & seed positions ────────────────────────────────────────────────
     rows   = (n + cols - 1) // cols
@@ -1719,8 +1702,8 @@ def show_poem_voronoi(text, size=160, steps=300, cols=5, out="lenia_voronoi.png"
         wy, wx = np.where(labels == i)
         # Tile the Lenia pattern from the seed position
         sy, sx = int(seeds[i, 1]), int(seeds[i, 0])
-        py = (wy - sy) % size
-        px = (wx - sx) % size
+        py = (wy - sy) % psize
+        px = (wx - sx) % psize
         canvas[wy, wx] = patterns[ch][py, px]
 
     # ── cell boundary: widen to ~3 px ─────────────────────────────────────────
@@ -1765,17 +1748,7 @@ def show_poem_voronoi(text, size=160, steps=300, cols=5, out="lenia_voronoi.png"
     canvas[~outer_mask] = 0.0               # everything outside → dark background
 
     # ── render ─────────────────────────────────────────────────────────────────
-    dpi = 110
-    fig, ax = plt.subplots(figsize=(W / dpi, H / dpi))
-    fig.patch.set_facecolor("#080808")
-    ax.set_facecolor("#080808")
-    ax.imshow(canvas, interpolation="bilinear")
-    ax.set_xlim(0, W); ax.set_ylim(H, 0)
-    ax.axis("off")
-    plt.tight_layout(pad=0)
-    plt.savefig(out, dpi=dpi*2, bbox_inches="tight", facecolor="#000000")
-    plt.show()
-    print(f"saved → {out}")
+    _render_save(canvas, W, H, out, pad=0)
 
 
 # ── Triangular mosaic layout ──────────────────────────────────────────────────

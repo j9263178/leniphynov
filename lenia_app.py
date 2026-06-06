@@ -2,7 +2,7 @@
 造字系統 — Gradio 互動介面
 run: python lenia_app.py
 """
-import os, tempfile, functools
+import os, tempfile, functools, io, base64
 
 # Must set non-interactive backend before any matplotlib import
 import matplotlib
@@ -20,6 +20,7 @@ from lenia_text import (
     show_poem_waves,
     show_poem_mixed,
     set_granularity,
+    set_progress_cb,
 )
 
 # 粒度標籤 → lenia_text 內部代號
@@ -44,14 +45,65 @@ MODES = {
 }
 
 
+# ── self-contained zoomable/pannable image (option A) ───────────────────────────
+# The handlers are INLINE event attributes, so they are honoured the moment the
+# browser parses the HTML gradio injects — no reliance on demo.load(js=...) timing
+# or global scope, and they survive every gradio re-render.
+_ZW = (
+    "var d=this,i=d.firstElementChild;if(!d._z)d._z={s:1,x:0,y:0};var z=d._z;"
+    "event.preventDefault();"
+    "z.s=Math.min(12,Math.max(0.2,z.s*Math.exp(-event.deltaY*0.0015)));"
+    "if(z.s<=1){z.x=0;z.y=0;}"
+    "i.style.transformOrigin='top center';"
+    "i.style.transform='translate('+z.x+'px,'+z.y+'px) scale('+z.s+')';"
+    # shrink the container with the image (origin=top) so a zoomed-out image
+    # stays flush at the top with no empty space → no page scrolling.
+    "d.style.height=(z.s<1?(i.offsetHeight*z.s):i.offsetHeight)+'px';"
+    "i.style.cursor=z.s>1?'grab':'zoom-in';"
+)
+_ZDOWN = ("var d=this;if(!d._z||d._z.s<=1)return;"
+          "d._drag={sx:event.clientX-d._z.x,sy:event.clientY-d._z.y};"
+          "event.preventDefault();")
+_ZMOVE = ("var d=this;if(!d._drag)return;var i=d.firstElementChild,z=d._z;"
+          "z.x=event.clientX-d._drag.sx;z.y=event.clientY-d._drag.sy;"
+          "i.style.transform='translate('+z.x+'px,'+z.y+'px) scale('+z.s+')';")
+_ZUP   = "this._drag=null;"
+_ZRESET = ("var d=this,i=d.firstElementChild;d._z={s:1,x:0,y:0};"
+           "i.style.transform='';i.style.transformOrigin='top center';"
+           "d.style.height='';i.style.cursor='zoom-in';")
+
+
+def _zoom_html(img):
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    b64 = base64.b64encode(buf.getvalue()).decode()
+    return (
+        f'<div class="zoomwrap" '
+        f'style="overflow:hidden;width:100%;background:#000;line-height:0;'
+        f'user-select:none;touch-action:none;" '
+        f'title="滾輪縮放 · 拖曳平移 · 雙擊還原" '
+        f'onwheel="{_ZW}" onmousedown="{_ZDOWN}" onmousemove="{_ZMOVE}" '
+        f'onmouseup="{_ZUP}" onmouseleave="{_ZUP}" ondblclick="{_ZRESET}">'
+        f'<img src="data:image/png;base64,{b64}" '
+        f'style="width:100%;display:block;cursor:zoom-in;'
+        f'transition:transform .03s linear;" draggable="false"/>'
+        f'</div>'
+    )
+
+
 def generate(text, mode_label, grain_label, group_size, cols, steps,
-             octaves, wave_base, row_shift,
-             germ_steps, germ_sa, germ_ra, germ_so):
+             octaves, wave_base, row_shift, pat_scale,
+             germ_steps, germ_sa, germ_ra, germ_so,
+             progress=gr.Progress()):
     text = text.strip()
     if not text:
-        return None
+        return ""
 
     set_granularity(GRAINS.get(grain_label, "char"))
+
+    # Route lenia_text's status updates into the Gradio progress bar.
+    progress(0.0, desc="準備中…")
+    set_progress_cb(lambda frac, desc: progress(frac, desc=desc))
 
     tmp = tempfile.mktemp(suffix=".png")
     fn  = MODES[mode_label]
@@ -61,6 +113,8 @@ def generate(text, mode_label, grain_label, group_size, cols, steps,
         kwargs["group_size"] = int(group_size)
     if any(k in mode_label for k in ("waves", "mixed", "poly")):
         kwargs["row_shift"] = float(row_shift)
+    if any(k in mode_label for k in ("grouped", "waves", "mixed", "noise", "voronoi")):
+        kwargs["pat_scale"] = float(pat_scale)
     if "germ" in mode_label:
         kwargs["germ_steps"] = int(germ_steps)
         kwargs["germ_sa"]    = float(germ_sa)
@@ -70,10 +124,13 @@ def generate(text, mode_label, grain_label, group_size, cols, steps,
         kwargs["octaves"]   = int(octaves)
         kwargs["wave_base"] = float(wave_base)
 
-    fn(text, **kwargs)
+    try:
+        fn(text, **kwargs)
+    finally:
+        set_progress_cb(None)
 
     img = Image.open(tmp)
-    return img
+    return _zoom_html(img)
 
 
 # ── UI ────────────────────────────────────────────────────────────────────────
@@ -266,9 +323,23 @@ tbody tr { border-bottom: 1px solid #111 !important; cursor: pointer !important;
 tbody tr:hover { background: #0d0d0d !important; }
 tbody td { font-size: 13px !important; padding: 10px 12px !important; }
 
-/* ── 隱藏頂部系統進度條，只保留按鈕 loading 狀態 ── */
-#progress-bar, .progress-bar, .progress-bar-wrap,
-div[id="progress"], .generating { display: none !important; }
+/* ── 進度 / 狀態顯示：純白字、透明底、無方塊 ── */
+.progress-bar-wrap, .progress-bar, .progress-text,
+.progress-level, .progress-level-inner,
+.meta-text, .meta-text-center, .generating {
+    background: transparent !important;
+    background-color: transparent !important;
+    border: none !important;
+    box-shadow: none !important;
+    color: #fff !important;
+    opacity: 1 !important;
+}
+.progress-bar, .progress-text, .meta-text, .meta-text-center, .generating {
+    display: block !important;
+    width: auto !important;
+    font-size: 12px !important;
+    letter-spacing: 0.08em !important;
+}
 
 /* ── 按鈕 loading 動畫 ── */
 button.primary.running,
@@ -284,6 +355,10 @@ footer, .footer, .built-with { display: none !important; }
 ::-webkit-scrollbar { width: 3px; height: 3px; }
 ::-webkit-scrollbar-track { background: #000; }
 ::-webkit-scrollbar-thumb { background: #333; border-radius: 2px; }
+
+/* ── 輸出圖縮放/平移容器 ── */
+#zoomimg, #zoomimg * { overflow: visible; }
+#zoomimg .zoomwrap { overflow: hidden !important; }
 """
 
 _HEADER = """
@@ -293,7 +368,7 @@ _HEADER = """
 </div>
 """
 
-with gr.Blocks(title="造字系統") as demo:
+with gr.Blocks(title="造字系統", theme=gr.themes.Base(), css=css) as demo:
     gr.HTML(_HEADER)
 
     with gr.Row(equal_height=False):
@@ -329,12 +404,16 @@ with gr.Blocks(title="造字系統") as demo:
 
             with gr.Accordion("進階參數", open=False):
                 group_sel = gr.Slider(
-                    2, 3, value=3, step=1,
+                    1, 3, value=3, step=1,
                     label="每組字數（grouped 模式）",
                 )
                 row_shift_sel = gr.Slider(
                     0.0, 1.0, value=0.5, step=0.05,
                     label="行偏移量（waves / mixed）",
+                )
+                pat_scale_sel = gr.Slider(
+                    1.0, 4.0, value=1.0, step=0.25,
+                    label="pattern 放大倍率（grouped / waves / mixed / noise / voronoi）",
                 )
                 with gr.Row():
                     octaves_sel = gr.Slider(
@@ -372,12 +451,17 @@ with gr.Blocks(title="造字系統") as demo:
 
         # ── right panel ───────────────────────────────────────────────────────
         with gr.Column(scale=2):
-            img_out = gr.Image(label="輸出", type="pil", height=300)
+            gr.HTML('<span style="font-size:13px;color:#fff;">輸出</span>'
+                    '<span style="font-size:11px;color:#666;margin-left:10px;">'
+                    '滾輪縮放 · 拖曳平移 · 雙擊還原</span>')
+            img_out = gr.HTML(
+                '<div class="zoomwrap" style="width:100%;min-height:200px;"></div>',
+                elem_id="zoomimg")
 
     btn.click(
         fn=generate,
         inputs=[text_in, mode_sel, grain_sel, group_sel, cols_sel, steps_sel,
-                octaves_sel, wave_base_sel, row_shift_sel,
+                octaves_sel, wave_base_sel, row_shift_sel, pat_scale_sel,
                 germ_steps_sel, germ_sa_sel, germ_ra_sel, germ_so_sel],
         outputs=[img_out],
     )
@@ -385,16 +469,28 @@ with gr.Blocks(title="造字系統") as demo:
     _G = list(GRAINS.keys())
     gr.Examples(
         examples=[
-            ["床前明月光，疑是地上霜。舉頭望明月，低頭思故鄉。", list(MODES.keys())[0], _G[0], 3, 4, 300, 4, 1.3, 0.5, 100, 38, 45, 9],
-            ["床前明月光，疑是地上霜。舉頭望明月，低頭思故鄉。", list(MODES.keys())[1], _G[1], 3, 4, 300, 4, 1.3, 0.5, 100, 38, 45, 9],
-            ["春眠不覺曉，處處聞啼鳥。夜來風雨聲，花落知多少。", list(MODES.keys())[2], _G[1], 3, 5, 300, 4, 1.3, 0.5, 100, 38, 45, 9],
-            ["白日依山盡，黃河入海流。欲窮千里目，更上一層樓。", list(MODES.keys())[4], _G[0], 3, 5, 300, 6, 2.0, 0.5, 100, 38, 45, 9],
+            # 短詩
+            ["床前明月光，疑是地上霜。舉頭望明月，低頭思故鄉。",
+             list(MODES.keys())[0], _G[0], 3, 4, 300, 4, 1.3, 0.5, 1.0, 100, 38, 45, 9],
+            # 較長的句子（中文，約 200 字）
+            ["慶曆四年春，滕子京謫守巴陵郡。越明年，政通人和，百廢具興，乃重修岳陽樓，"
+             "增其舊制，刻唐賢今人詩賦於其上，屬予作文以記之。予觀夫巴陵勝狀，在洞庭一湖。"
+             "銜遠山，吞長江，浩浩湯湯，橫無際涯；朝暉夕陰，氣象萬千。此則岳陽樓之大觀也，"
+             "前人之述備矣。然則北通巫峽，南極瀟湘，遷客騷人，多會於此，覽物之情，得無異乎？",
+             list(MODES.keys())[2], _G[1], 6, 6, 300, 4, 1.3, 0.5, 1.0, 100, 38, 45, 9],
+            # 較長的句子（英文）
+            ["It was the best of times, it was the worst of times, it was the age "
+             "of wisdom, it was the age of foolishness, it was the epoch of belief, "
+             "it was the epoch of incredulity, it was the season of Light, it was "
+             "the season of Darkness, it was the spring of hope, it was the winter "
+             "of despair.",
+             list(MODES.keys())[5], _G[2], 3, 6, 300, 4, 1.3, 0.5, 1.0, 100, 38, 45, 9],
         ],
         inputs=[text_in, mode_sel, grain_sel, group_sel, cols_sel, steps_sel,
-                octaves_sel, wave_base_sel, row_shift_sel,
+                octaves_sel, wave_base_sel, row_shift_sel, pat_scale_sel,
                 germ_steps_sel, germ_sa_sel, germ_ra_sel, germ_so_sel],
         label="範例",
     )
 
 if __name__ == "__main__":
-    demo.launch(inbrowser=True, theme=gr.themes.Base(), css=css)
+    demo.launch(inbrowser=True)
