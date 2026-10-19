@@ -16,6 +16,7 @@ run(單獨試用):
     python zhuyin_font.py 火水山        # 印出各字的符號與拼法
 """
 from __future__ import annotations
+import hashlib
 import json
 import sys
 import time
@@ -38,6 +39,30 @@ S._embed_retry = _cached_only
 BATCH = 50
 PACE = 40         # 秒;每批之間的間隔(免費額度:一次 100 個字會被擋,50 個可以)
 
+# Standalone / poetry users retain the old single-glyph default. A font build
+# opts into expansion explicitly; the shared semantic basis and cache are untouched.
+_OPTIONS = {}
+
+
+def configure(options: dict) -> None:
+    global _OPTIONS
+    unknown = set(options) - {"split_probability", "split_gap", "allow_embedding_requests"}
+    if unknown:
+        raise ValueError(f"Unknown font provider settings: {sorted(unknown)}")
+    probability = float(options.get("split_probability", 0.0))
+    gap = float(options.get("split_gap", 0.18))
+    if not 0 <= probability <= 1 or not 0 <= gap <= 1:
+        raise ValueError("split_probability and split_gap must be between zero and one")
+    _OPTIONS = dict(options, split_probability=probability, split_gap=gap)
+
+
+def part_count(ch: str) -> int:
+    """Stable per codepoint, independent of embeddings, worker order and rebuilds."""
+    code = ord(ch)
+    cjk = 0x3400 <= code <= 0x4DBF or 0x4E00 <= code <= 0x9FFF or 0x20000 <= code <= 0x323AF
+    value = int.from_bytes(hashlib.sha256(("zhuyin-length-v1:" + ch).encode()).digest()[:8], "big") / 2**64
+    return 2 if cjk and value < _OPTIONS.get("split_probability", 0.0) else 1
+
 
 def _batch_embed(texts: list[str]) -> list[np.ndarray]:
     L = S._L
@@ -54,6 +79,9 @@ def _batch_embed(texts: list[str]) -> list[np.ndarray]:
 
 def prepare(chars) -> None:
     """快取裡沒有語意向量的字,分批向 Gemini 要(和 lenia_text._embed 同一個模型、維度、正規化)。"""
+    if not _OPTIONS.get("allow_embedding_requests", True):
+        print("[zhuyin_font] Cache-only build; no embedding requests or cache updates")
+        return
     L = S._L
     if L is None or not L._GEMINI_KEY:
         print("[zhuyin_font] 沒有 GEMINI_API_KEY,沒有向量的字會用雜湊造字")
@@ -87,8 +115,7 @@ def prepare(chars) -> None:
             time.sleep(PACE)                             # 一批 50 個字,不撞到速率限制
 
 
-def glyph(ch: str, cell: int) -> dict | None:
-    v, real = S.text_vector(ch)
+def _part(v: np.ndarray, real: bool, cell: int) -> dict | None:
     seq, style, _, rots = S.vector_to_glyph(v, real)
     g = Z.compose(seq, style, S=cell, rotations=rots, **S.LOOK)
     xs = np.where(g.max(axis=0) > 0.05)[0]
@@ -99,6 +126,32 @@ def glyph(ch: str, cell: int) -> dict | None:
     gap = 0.02 + 0.45 * u[15]                          # 與文章排版同一個字距規則
     return {"alpha": g, "advance": g.shape[1] + gap * cell, "key": f"{seq}|{style}",
             "info": f"{seq} {style}" + ("" if real else " (雜湊)")}
+
+
+def glyph(ch: str, cell: int) -> dict | None:
+    v, real = S.text_vector(ch)
+    first = _part(v, real, cell)
+    if first is None:
+        return None
+    first["parts"] = 1
+    if part_count(ch) == 1:
+        return first
+    # A fixed orthogonal transform provides another view of the same vector;
+    # it needs no new embedding and preserves neighbourhoods in vector space.
+    # Keep the original first part, and avoid duplicating its symbol/layout key.
+    for attempt in range(8):
+        seed = int.from_bytes(hashlib.sha256(f"zhuyin-second-v1:{attempt}".encode()).digest()[:8], "big")
+        rng = np.random.default_rng(seed)
+        second = _part(v[rng.permutation(len(v))] * rng.choice([-1, 1], len(v)), real, cell)
+        if second is not None and second["key"] != first["key"]:
+            break
+    else:
+        raise ValueError(f"Cannot generate a distinct second part for U+{ord(ch):04X}")
+    gap = max(1, round(cell * _OPTIONS["split_gap"]))
+    alpha = np.concatenate([first["alpha"], np.zeros((cell, gap)), second["alpha"]], axis=1)
+    return {"alpha": alpha, "advance": first["alpha"].shape[1] + gap + second["advance"],
+            "key": first["key"] + " + " + second["key"],
+            "info": first["info"] + " + " + second["info"], "parts": 2}
 
 
 if __name__ == "__main__":
